@@ -31,114 +31,117 @@ type SlowQuery struct {
 }
 
 func main() {
-	// データベース接続情報
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatalf("Error loading .env file")
-	}
+	// 環境変数の読み込み
+	loadEnv()
 
-	dbUser := os.Getenv("DB_USER")
-	dbPass := os.Getenv("DB_PASS")
-	dbHost := os.Getenv("DB_HOST")
-	dbHost_slave := os.Getenv("DB_HOST_SLAVE")
-	dbPort := os.Getenv("DB_PORT")
-	dbService := os.Getenv("DB_SERVICE")
-	// Slack Bot Token
-	slackWebhookEndpoint := os.Getenv("SLACK_WEBHOOK_ENDPOINT")
-	// slackChannel := os.Getenv("SLACK_CHANNEL")
-	// データベース接続文字列
-	connString := fmt.Sprintf("%s/%s@%s:%s/%s", dbUser, dbPass, dbHost, dbPort, dbService)
-	connString_slave := fmt.Sprintf("%s/%s@%s:%s/%s", dbUser, dbPass, dbHost_slave, dbPort, dbService)
-	// データベース接続
-	db, err := sql.Open("godror", connString)
-	if err != nil {
-		log.Fatalf("データベース接続エラー: %v", err)
-	}
-	defer db.Close()
-	// SQLクエリ実行
-	var slowQueries []SlowQuery
-	slowQueries, err = selectSlowQueries(db)
-	if err != nil {
-		log.Fatalf("SQLクエリ実行エラー: %v", err)
-	}
+	// データベース接続情報の取得
+	dbUser, dbPass, dbHost, dbHost_slave, dbPort, dbService, slackWebhookEndpoint := getDBInfo()
 
-	// スレーブデータベース接続
-	db_slave, err := sql.Open("godror", connString_slave)
-	if err != nil {
-		log.Fatalf("スレーブデータベース接続エラー: %v", err)
-	}
-	defer db_slave.Close()
-	// SQLクエリ実行
-	var slowQueries_slave []SlowQuery
-	slowQueries_slave, err = selectSlowQueries(db_slave)
-	if err != nil {
-		log.Fatalf("スレーブSQLクエリ実行エラー: %v", err)
-	}
+	// データベース接続文字列の作成
+	connString, connString_slave := createConnString(dbUser, dbPass, dbHost, dbHost_slave, dbPort, dbService)
 
+	// データベース接続とクエリ実行
+	slowQueries := connectAndQuery(connString, "データベース接続エラー", "SQLクエリ実行エラー")
+	slowQueries_slave := connectAndQuery(connString_slave, "スレーブデータベース接続エラー", "スレーブSQLクエリ実行エラー")
+
+	// スロークエリが存在する場合、Slackに通知
 	if len(slowQueries)+len(slowQueries_slave) > 0 {
-		// Slack通知
-		webhookURL := slackWebhookEndpoint
-		message := formatSlackMessage(slowQueries, "本番DB１号機")
-		message += formatSlackMessage(slowQueries_slave, "本番DB２号機")
-		payload := map[string]string{"text": message}
-		payloadBytes, err := json.Marshal(payload)
-		if err != nil {
-			log.Printf("JSONマーシャリングエラー: %v", err)
-			return
-		}
-		resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(payloadBytes))
-		if err != nil {
-			log.Printf("Slack通知エラー: %v", err)
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Slack通知失敗: ステータスコード %d", resp.StatusCode)
-		} else {
-			log.Println("Slack通知を送信しました")
-		}
+		sendSlackNotification(slackWebhookEndpoint, slowQueries, slowQueries_slave)
 	} else {
 		log.Println("スロークエリは検出されませんでした")
 	}
 }
 
+func loadEnv() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatalf("Error loading .env file")
+	}
+}
+
+func getDBInfo() (string, string, string, string, string, string, string) {
+	return os.Getenv("DB_USER"), os.Getenv("DB_PASS"), os.Getenv("DB_HOST"), os.Getenv("DB_HOST_SLAVE"), os.Getenv("DB_PORT"), os.Getenv("DB_SERVICE"), os.Getenv("SLACK_WEBHOOK_ENDPOINT")
+}
+
+func createConnString(dbUser, dbPass, dbHost, dbHost_slave, dbPort, dbService string) (string, string) {
+	return fmt.Sprintf("%s/%s@%s:%s/%s", dbUser, dbPass, dbHost, dbPort, dbService), fmt.Sprintf("%s/%s@%s:%s/%s", dbUser, dbPass, dbHost_slave, dbPort, dbService)
+}
+
+func connectAndQuery(connString, connectErrorMsg, queryErrorMsg string) []SlowQuery {
+	db, err := sql.Open("godror", connString)
+	if err != nil {
+		log.Fatalf(connectErrorMsg+": %v", err)
+	}
+	defer db.Close()
+
+	slowQueries, err := selectSlowQueries(db)
+	if err != nil {
+		log.Fatalf(queryErrorMsg+": %v", err)
+	}
+
+	return slowQueries
+}
+
+func sendSlackNotification(slackWebhookEndpoint string, slowQueries, slowQueries_slave []SlowQuery) {
+	webhookURL := slackWebhookEndpoint
+	message := formatSlackMessage(slowQueries, "本番DB１号機")
+	message += formatSlackMessage(slowQueries_slave, "本番DB２号機")
+	payload := map[string]string{"text": message}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("JSONマーシャリングエラー: %v", err)
+		return
+	}
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		log.Printf("Slack通知エラー: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Slack通知失敗: ステータスコード %d", resp.StatusCode)
+	} else {
+		log.Println("Slack通知を送信しました")
+	}
+}
+
 func selectSlowQueries(db *sql.DB) ([]SlowQuery, error) {
 	rows, err := db.Query(`
-	WITH long_running_queries AS (
-		SELECT
-			s.sid,
-			s.serial#,
-			s.username,
-			s.machine,
-			s.program,
-			s.sql_id,
-			q.sql_text,
-			s.event,
-			s.wait_class,
-			s.seconds_in_wait,
-			ROUND((SYSDATE - s.sql_exec_start) * 24 * 60, 2) as minutes_running,
-			s.status
-		FROM
-			v$session s
-		JOIN
-			v$sql q ON s.sql_id = q.sql_id
-		WHERE
-			s.type = 'USER'
-			AND s.status = 'ACTIVE'
-			AND s.sql_exec_start IS NOT NULL
-			AND (
-				(SYSDATE - s.sql_exec_start) * 24 * 60 >= 30
-				OR s.seconds_in_wait > 300
-			)
-	)
-	SELECT
-		lrq.*,
-		'ALTER SYSTEM KILL SESSION ''' || lrq.sid || ',' || lrq.serial# || ''' IMMEDIATE;' AS kill_session_sql
-	FROM
-		long_running_queries lrq
-	ORDER BY
-		lrq.minutes_running DESC
-	`)
+    WITH long_running_queries AS (
+        SELECT
+            s.sid,
+            s.serial#,
+            s.username,
+            s.machine,
+            s.program,
+            s.sql_id,
+            q.sql_text,
+            s.event,
+            s.wait_class,
+            s.seconds_in_wait,
+            ROUND((SYSDATE - s.sql_exec_start) * 24 * 60, 2) as minutes_running,
+            s.status
+        FROM
+            v$session s
+        JOIN
+            v$sql q ON s.sql_id = q.sql_id
+        WHERE
+            s.type = 'USER'
+            AND s.status = 'ACTIVE'
+            AND s.sql_exec_start IS NOT NULL
+            AND (
+                (SYSDATE - s.sql_exec_start) * 24 * 60 >= 30
+                OR s.seconds_in_wait > 300
+            )
+    )
+    SELECT
+        lrq.*,
+        'ALTER SYSTEM KILL SESSION ''' || lrq.sid || ',' || lrq.serial# || ''' IMMEDIATE;' AS kill_session_sql
+    FROM
+        long_running_queries lrq
+    ORDER BY
+        lrq.minutes_running DESC
+    `)
 	if err != nil {
 		log.Fatalf("クエリ実行エラー: %v", err)
 	}
