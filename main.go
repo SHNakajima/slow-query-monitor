@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -53,9 +54,12 @@ func main() {
 }
 
 func loadEnv() {
-	err := godotenv.Load()
+	argEnv := flag.String("env", ".env", "環境変数ファイルのパス")
+	flag.Parse()
+	log.Printf("Loading .env file from : %s", *argEnv)
+	err := godotenv.Load(*argEnv)
 	if err != nil {
-		log.Fatalf("Error loading .env file")
+		log.Fatalf("Error loading .env file: %v", err)
 	}
 }
 
