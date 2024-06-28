@@ -31,23 +31,29 @@ type SlowQuery struct {
 	KillSessionSQL string
 }
 
+type DatabaseConfig struct {
+	User     string
+	Password string
+	Host     string
+	Port     string
+	Service  string
+}
+
 func main() {
 	// 環境変数の読み込み
 	loadEnv()
 
-	// データベース接続情報の取得
-	dbUser, dbPass, dbHost, dbHost_slave, dbPort, dbService, slackWebhookEndpoint := getDBInfo()
+	// データベース設定の取得
+	mainDBConfig, slaveDBConfig := getDBConfigs()
+	slackWebhookEndpoint := os.Getenv("SLACK_WEBHOOK_ENDPOINT")
 
-	// データベース接続文字列の作成
-	connString, connString_slave := createConnString(dbUser, dbPass, dbHost, dbHost_slave, dbPort, dbService)
-
-	// データベース接続とクエリ実行
-	slowQueries := connectAndQuery(connString, "データベース接続エラー", "SQLクエリ実行エラー")
-	slowQueries_slave := connectAndQuery(connString_slave, "スレーブデータベース接続エラー", "スレーブSQLクエリ実行エラー")
+	// スロークエリの取得
+	slowQueries := getSlowQueries(mainDBConfig, "データベース接続エラー", "SQLクエリ実行エラー")
+	slowQueriesSlave := getSlowQueries(slaveDBConfig, "スレーブデータベース接続エラー", "スレーブSQLクエリ実行エラー")
 
 	// スロークエリが存在する場合、Slackに通知
-	if len(slowQueries)+len(slowQueries_slave) > 0 {
-		sendSlackNotification(slackWebhookEndpoint, slowQueries, slowQueries_slave)
+	if len(slowQueries)+len(slowQueriesSlave) > 0 {
+		sendSlackNotification(slackWebhookEndpoint, slowQueries, slowQueriesSlave)
 	} else {
 		log.Println("スロークエリは検出されませんでした")
 	}
@@ -57,21 +63,37 @@ func loadEnv() {
 	argEnv := flag.String("env", ".env", "環境変数ファイルのパス")
 	flag.Parse()
 	log.Printf("Loading .env file from : %s", *argEnv)
-	err := godotenv.Load(*argEnv)
-	if err != nil {
+	if err := godotenv.Load(*argEnv); err != nil {
 		log.Fatalf("Error loading .env file: %v", err)
 	}
 }
 
-func getDBInfo() (string, string, string, string, string, string, string) {
-	return os.Getenv("DB_USER"), os.Getenv("DB_PASS"), os.Getenv("DB_HOST"), os.Getenv("DB_HOST_SLAVE"), os.Getenv("DB_PORT"), os.Getenv("DB_SERVICE"), os.Getenv("SLACK_WEBHOOK_ENDPOINT")
+func getDBConfigs() (DatabaseConfig, DatabaseConfig) {
+	mainConfig := DatabaseConfig{
+		User:     os.Getenv("DB_USER"),
+		Password: os.Getenv("DB_PASS"),
+		Host:     os.Getenv("DB_HOST"),
+		Port:     os.Getenv("DB_PORT"),
+		Service:  os.Getenv("DB_SERVICE"),
+	}
+
+	slaveConfig := DatabaseConfig{
+		User:     os.Getenv("DB_USER"),
+		Password: os.Getenv("DB_PASS"),
+		Host:     os.Getenv("DB_HOST_SLAVE"),
+		Port:     os.Getenv("DB_PORT"),
+		Service:  os.Getenv("DB_SERVICE"),
+	}
+
+	return mainConfig, slaveConfig
 }
 
-func createConnString(dbUser, dbPass, dbHost, dbHost_slave, dbPort, dbService string) (string, string) {
-	return fmt.Sprintf("%s/%s@%s:%s/%s", dbUser, dbPass, dbHost, dbPort, dbService), fmt.Sprintf("%s/%s@%s:%s/%s", dbUser, dbPass, dbHost_slave, dbPort, dbService)
+func createConnString(config DatabaseConfig) string {
+	return fmt.Sprintf("%s/%s@%s:%s/%s", config.User, config.Password, config.Host, config.Port, config.Service)
 }
 
-func connectAndQuery(connString, connectErrorMsg, queryErrorMsg string) []SlowQuery {
+func getSlowQueries(config DatabaseConfig, connectErrorMsg, queryErrorMsg string) []SlowQuery {
+	connString := createConnString(config)
 	db, err := sql.Open("godror", connString)
 	if err != nil {
 		log.Fatalf(connectErrorMsg+": %v", err)
@@ -86,22 +108,23 @@ func connectAndQuery(connString, connectErrorMsg, queryErrorMsg string) []SlowQu
 	return slowQueries
 }
 
-func sendSlackNotification(slackWebhookEndpoint string, slowQueries, slowQueries_slave []SlowQuery) {
-	webhookURL := slackWebhookEndpoint
+func sendSlackNotification(slackWebhookEndpoint string, slowQueries, slowQueriesSlave []SlowQuery) {
 	message := formatSlackMessage(slowQueries, "本番DB１号機")
-	message += formatSlackMessage(slowQueries_slave, "本番DB２号機")
+	message += formatSlackMessage(slowQueriesSlave, "本番DB２号機")
 	payload := map[string]string{"text": message}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("JSONマーシャリングエラー: %v", err)
 		return
 	}
-	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(payloadBytes))
+
+	resp, err := http.Post(slackWebhookEndpoint, "application/json", bytes.NewBuffer(payloadBytes))
 	if err != nil {
 		log.Printf("Slack通知エラー: %v", err)
 		return
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Slack通知失敗: ステータスコード %d", resp.StatusCode)
 	} else {
@@ -110,7 +133,7 @@ func sendSlackNotification(slackWebhookEndpoint string, slowQueries, slowQueries
 }
 
 func selectSlowQueries(db *sql.DB) ([]SlowQuery, error) {
-	rows, err := db.Query(`
+	query := `
     WITH long_running_queries AS (
         SELECT
             s.sid,
@@ -145,11 +168,14 @@ func selectSlowQueries(db *sql.DB) ([]SlowQuery, error) {
         long_running_queries lrq
     ORDER BY
         lrq.minutes_running DESC
-    `)
+    `
+
+	rows, err := db.Query(query)
 	if err != nil {
-		log.Fatalf("クエリ実行エラー: %v", err)
+		return nil, fmt.Errorf("クエリ実行エラー: %v", err)
 	}
 	defer rows.Close()
+
 	var slowQueries []SlowQuery
 	for rows.Next() {
 		var sq SlowQuery
